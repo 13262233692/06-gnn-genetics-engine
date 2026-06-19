@@ -3,13 +3,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import os
+import gc
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch_geometric.loader import DataLoader
+from torch_geometric.loader import NeighborLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, precision_recall_curve,
     average_precision_score, f1_score
@@ -17,7 +17,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 from config import settings
 from .gnn_model import HeterogeneousGNN, GeneticsGNN
-from .graph_converter import GraphConverter, PyGGraphData
+from .graph_converter import GraphConverter, PyGGraphData, SampledGraphData
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +25,17 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TrainingConfig:
     learning_rate: float = 0.001
-    batch_size: int = 64
+    batch_size: int = 256
     epochs: int = 100
     patience: int = 15
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
+    gradient_clip_norm: float = 5.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    max_grad_norm_log: float = 100.0
+    nan_patience: int = 3
+    use_amp: bool = True
+    label_smoothing: float = 0.1
 
 
 @dataclass
@@ -46,6 +51,9 @@ class TrainingResult:
     incremental: bool = False
     new_nodes_count: int = 0
     new_edges_count: int = 0
+    nan_recovery_count: int = 0
+    oom_recovery_count: int = 0
+    errors: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -59,7 +67,9 @@ class TrainingResult:
             "training_history": self.training_history,
             "incremental": self.incremental,
             "new_nodes_count": self.new_nodes_count,
-            "new_edges_count": self.new_edges_count
+            "new_edges_count": self.new_edges_count,
+            "nan_recovery_count": self.nan_recovery_count,
+            "oom_recovery_count": self.oom_recovery_count
         }
 
 
@@ -77,7 +87,9 @@ class GNNTrainer:
         )
         self.device = torch.device(self.config.device)
         self.graph_converter = graph_converter or GraphConverter(
-            embedding_dim=settings.GNN_EMBEDDING_DIM
+            embedding_dim=settings.GNN_EMBEDDING_DIM,
+            num_neighbors=settings.SAMPLING_NUM_NEIGHBORS,
+            batch_size=self.config.batch_size
         )
 
         if model is None:
@@ -87,7 +99,9 @@ class GNNTrainer:
                 node_types=self.graph_converter.NODE_TYPES,
                 edge_types=self.graph_converter.EDGE_TYPES,
                 dropout=settings.GNN_DROPOUT,
-                embedding_dim=settings.GNN_EMBEDDING_DIM
+                embedding_dim=settings.GNN_EMBEDDING_DIM,
+                residual_alpha=settings.RESIDUAL_ALPHA,
+                layer_norm_eps=settings.LAYER_NORM_EPS
             )
         else:
             self.model = model
@@ -101,40 +115,324 @@ class GNNTrainer:
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode='min', patience=5, factor=0.5
         )
-        self.criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, 3.0]).to(self.device))
+
+        class_weights = torch.tensor([1.0, 3.0]).to(self.device)
+        self.criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=self.config.label_smoothing
+        )
+
+        self.scaler = torch.amp.GradScaler(
+            self.device.type,
+            enabled=self.config.use_amp and self.device.type == 'cuda'
+        )
 
         self.last_train_timestamp = None
         self.is_trained = False
+        self._nan_counter = 0
 
-    def _prepare_labels(
+    def _extract_batch_data(self, batch):
+        x_dict = {}
+        edge_index_dict = {}
+
+        for node_type in self.model.node_types:
+            if node_type in batch and 'x' in batch[node_type]:
+                x_dict[node_type] = batch[node_type].x
+
+        for edge_type in batch.edge_types:
+            if hasattr(batch[edge_type], 'edge_index'):
+                edge_index_dict[edge_type] = batch[edge_type].edge_index
+
+        return x_dict, edge_index_dict
+
+    def _get_input_node_indices(self, batch, node_type='SNP'):
+        if node_type in batch and hasattr(batch[node_type], 'n_id'):
+            return batch[node_type].n_id
+        if hasattr(batch, f'{node_type}_batch'):
+            return getattr(batch, f'{node_type}_batch')
+        return None
+
+    async def train_sampled(
         self,
-        pyg_data: PyGGraphData
-    ):
-        data = pyg_data.data
+        sampled_data: SampledGraphData,
+        incremental: bool = False,
+        new_nodes_count: int = 0,
+        new_edges_count: int = 0
+    ) -> TrainingResult:
+        logger.info(f"Starting {'incremental ' if incremental else ''}sampled training")
+
+        result = TrainingResult(
+            model_path=settings.GNN_MODEL_PATH,
+            final_loss=0.0,
+            final_accuracy=0.0,
+            final_auc=0.0,
+            epochs_trained=0,
+            incremental=incremental,
+            new_nodes_count=new_nodes_count,
+            new_edges_count=new_edges_count
+        )
+
+        if sampled_data.train_loader is None:
+            logger.warning("No train loader available, falling back to full-graph training")
+            pyg_data = PyGGraphData(
+                data=sampled_data.data,
+                node_mapping=sampled_data.node_mapping,
+                edge_mapping={},
+                node_type_encoder=self.graph_converter.node_type_encoder,
+                edge_type_encoder=self.graph_converter.edge_type_encoder
+            )
+            return await self.train(pyg_data, incremental, new_nodes_count, new_edges_count)
+
+        data = sampled_data.data
         if 'SNP' in data and 'y' in data['SNP']:
-            labels = data['SNP'].y.long()
-            train_mask, val_mask, test_mask = self._split_data(labels)
-            return data, labels, train_mask, val_mask, test_mask
-        return data, None, None, None, None
+            full_labels = data['SNP'].y.long()
+        else:
+            logger.warning("No labels available for training")
+            result.errors.append("No labels available")
+            return result
 
-    def _split_data(
-        self,
-        labels: torch.Tensor,
-        train_ratio: float = 0.7,
-        val_ratio: float = 0.15,
-        test_ratio: float = 0.15
-    ):
-        n = len(labels)
-        indices = torch.randperm(n)
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+        self._nan_counter = 0
 
-        train_end = int(n * train_ratio)
-        val_end = int(n * (train_ratio + val_ratio))
+        for epoch in range(self.config.epochs):
+            self.model.train()
+            train_losses = []
+            train_correct = 0
+            train_total = 0
 
-        train_mask = indices[:train_end]
-        val_mask = indices[train_end:val_end]
-        test_mask = indices[val_end:]
+            try:
+                for batch_idx, batch in enumerate(sampled_data.train_loader):
+                    batch = batch.to(self.device)
 
-        return train_mask, val_mask, test_mask
+                    x_dict, edge_index_dict = self._extract_batch_data(batch)
+
+                    if 'SNP' not in x_dict or x_dict['SNP'] is None:
+                        continue
+
+                    snp_n_id = self._get_input_node_indices(batch, 'SNP')
+
+                    if snp_n_id is not None and full_labels is not None:
+                        valid_mask = snp_n_id < len(full_labels)
+                        if valid_mask.sum() == 0:
+                            continue
+                        labels = full_labels[snp_n_id[valid_mask]]
+                        snp_x = x_dict['SNP'][valid_mask]
+                    else:
+                        labels = torch.zeros(x_dict['SNP'].size(0), dtype=torch.long, device=self.device)
+                        snp_x = x_dict['SNP']
+
+                    x_dict_filtered = {k: v for k, v in x_dict.items() if v is not None}
+                    edge_index_filtered = {k: v for k, v in edge_index_dict.items()
+                                          if k[0] in x_dict_filtered and k[2] in x_dict_filtered}
+
+                    self.optimizer.zero_grad()
+
+                    with torch.amp.autocast(
+                        device_type=self.device.type,
+                        enabled=self.config.use_amp and self.device.type == 'cuda'
+                    ):
+                        probabilities = self.model.predict_snp_importance(
+                            x_dict_filtered,
+                            edge_index_filtered
+                        )
+
+                        snp_probs = probabilities[:len(labels)]
+                        if snp_probs.size(0) != labels.size(0):
+                            min_len = min(snp_probs.size(0), labels.size(0))
+                            snp_probs = snp_probs[:min_len]
+                            labels = labels[:min_len]
+
+                        logits = torch.log(snp_probs + 1e-10)
+                        loss = self.criterion(logits, labels)
+
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        self._nan_counter += 1
+                        result.nan_recovery_count += 1
+                        logger.warning(
+                            f"NaN/Inf loss detected at epoch {epoch+1}, batch {batch_idx}. "
+                            f"NaN recovery count: {self._nan_counter}"
+                        )
+                        if self._nan_counter >= self.config.nan_patience:
+                            logger.error(f"NaN patience ({self.config.nan_patience}) exceeded, stopping training")
+                            result.errors.append(f"Training stopped due to persistent NaN loss after {epoch+1} epochs")
+                            if best_model_state is not None:
+                                self.model.load_state_dict(best_model_state)
+                            return result
+                        continue
+
+                    self.scaler.scale(loss).backward()
+
+                    self.scaler.unscale_(self.optimizer)
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.gradient_clip_norm
+                    )
+
+                    if total_norm > self.config.max_grad_norm_log:
+                        logger.warning(
+                            f"Large gradient norm at epoch {epoch+1}, batch {batch_idx}: {total_norm:.2f}"
+                        )
+
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+
+                    train_losses.append(loss.item())
+                    preds = snp_probs.argmax(dim=-1)
+                    train_correct += (preds == labels).sum().item()
+                    train_total += labels.size(0)
+
+                    del batch, x_dict, edge_index_dict, probabilities, loss
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    result.oom_recovery_count += 1
+                    logger.warning(f"CUDA OOM at epoch {epoch+1}, clearing cache and reducing batch")
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    gc.collect()
+                    if result.oom_recovery_count > 3:
+                        logger.error("OOM recovery limit exceeded, stopping training")
+                        result.errors.append("Training stopped due to persistent OOM")
+                        if best_model_state is not None:
+                            self.model.load_state_dict(best_model_state)
+                        return result
+                    continue
+                else:
+                    raise
+
+            avg_train_loss = np.mean(train_losses) if train_losses else float('nan')
+            train_acc = train_correct / max(train_total, 1)
+
+            self.model.eval()
+            val_losses = []
+            val_correct = 0
+            val_total = 0
+            all_val_probs = []
+            all_val_labels = []
+
+            with torch.no_grad():
+                for batch in sampled_data.val_loader:
+                    batch = batch.to(self.device)
+
+                    x_dict, edge_index_dict = self._extract_batch_data(batch)
+
+                    if 'SNP' not in x_dict or x_dict['SNP'] is None:
+                        continue
+
+                    snp_n_id = self._get_input_node_indices(batch, 'SNP')
+
+                    if snp_n_id is not None and full_labels is not None:
+                        valid_mask = snp_n_id < len(full_labels)
+                        if valid_mask.sum() == 0:
+                            continue
+                        labels = full_labels[snp_n_id[valid_mask]]
+                    else:
+                        labels = torch.zeros(x_dict['SNP'].size(0), dtype=torch.long, device=self.device)
+
+                    x_dict_filtered = {k: v for k, v in x_dict.items() if v is not None}
+                    edge_index_filtered = {k: v for k, v in edge_index_dict.items()
+                                          if k[0] in x_dict_filtered and k[2] in x_dict_filtered}
+
+                    with torch.amp.autocast(
+                        device_type=self.device.type,
+                        enabled=self.config.use_amp and self.device.type == 'cuda'
+                    ):
+                        probabilities = self.model.predict_snp_importance(
+                            x_dict_filtered,
+                            edge_index_filtered
+                        )
+
+                        snp_probs = probabilities[:len(labels)]
+                        if snp_probs.size(0) != labels.size(0):
+                            min_len = min(snp_probs.size(0), labels.size(0))
+                            snp_probs = snp_probs[:min_len]
+                            labels = labels[:min_len]
+
+                        logits = torch.log(snp_probs + 1e-10)
+                        val_loss = self.criterion(logits, labels)
+
+                    if not (torch.isnan(val_loss) or torch.isinf(val_loss)):
+                        val_losses.append(val_loss.item())
+                        preds = snp_probs.argmax(dim=-1)
+                        val_correct += (preds == labels).sum().item()
+                        val_total += labels.size(0)
+                        all_val_probs.append(snp_probs[:, 1].cpu())
+                        all_val_labels.append(labels.cpu())
+
+                    del batch
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+            avg_val_loss = np.mean(val_losses) if val_losses else float('inf')
+            val_acc = val_correct / max(val_total, 1)
+
+            val_auc = 0.5
+            if all_val_probs and all_val_labels:
+                try:
+                    all_val_probs_cat = torch.cat(all_val_probs).numpy()
+                    all_val_labels_cat = torch.cat(all_val_labels).numpy()
+                    if len(np.unique(all_val_labels_cat)) >= 2:
+                        val_auc = roc_auc_score(all_val_labels_cat, all_val_probs_cat)
+                except Exception:
+                    val_auc = 0.5
+
+            epoch_stats = {
+                "epoch": epoch + 1,
+                "train_loss": avg_train_loss,
+                "train_acc": train_acc,
+                "val_loss": avg_val_loss,
+                "val_acc": val_acc,
+                "val_auc": val_auc
+            }
+            result.training_history.append(epoch_stats)
+
+            logger.info(
+                f"Epoch {epoch + 1}/{self.config.epochs} - "
+                f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.4f}, "
+                f"Val Loss: {avg_val_loss:.4f}, Val AUC: {val_auc:.4f}"
+            )
+
+            self.scheduler.step(avg_val_loss)
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+            else:
+                patience_counter += 1
+                if patience_counter >= self.config.patience:
+                    logger.info(f"Early stopping at epoch {epoch + 1}")
+                    break
+
+            result.epochs_trained = epoch + 1
+
+            if self._nan_counter > 0 and epoch > 5 and avg_train_loss < float('nan'):
+                self._nan_counter = max(0, self._nan_counter - 1)
+
+        if best_model_state is not None:
+            self.model.load_state_dict(best_model_state)
+            self.model.to(self.device)
+
+        result.final_loss = best_val_loss
+        result.final_accuracy = val_acc if val_total > 0 else 0.0
+        result.final_auc = val_auc
+        result.completed_at = datetime.now()
+
+        self._save_model()
+        self.last_train_timestamp = datetime.now().isoformat()
+        self.is_trained = True
+
+        logger.info(
+            f"Sampled training completed. Val Loss: {best_val_loss:.4f}, "
+            f"Val Acc: {result.final_accuracy:.4f}, Val AUC: {val_auc:.4f}, "
+            f"NaN recoveries: {result.nan_recovery_count}, OOM recoveries: {result.oom_recovery_count}"
+        )
+
+        return result
 
     async def train(
         self,
@@ -143,7 +441,7 @@ class GNNTrainer:
         new_nodes_count: int = 0,
         new_edges_count: int = 0
     ) -> TrainingResult:
-        logger.info(f"Starting {'incremental ' if incremental else ''}training on {'' if incremental else 'full '}training")
+        logger.info(f"Starting {'incremental ' if incremental else ''}full-graph training")
 
         result = TrainingResult(
             model_path=settings.GNN_MODEL_PATH,
@@ -169,32 +467,66 @@ class GNNTrainer:
             best_val_loss = float('inf')
             patience_counter = 0
             best_model_state = None
+            self._nan_counter = 0
 
             self.model.train()
 
             for epoch in range(self.config.epochs):
                 self.optimizer.zero_grad()
 
-                probabilities = self.model.predict_snp_importance(data)
-                logits = torch.log(probabilities + 1e-10)
+                with torch.amp.autocast(
+                    device_type=self.device.type,
+                    enabled=self.config.use_amp and self.device.type == 'cuda'
+                ):
+                    x_dict = {}
+                    edge_index_dict = {}
+                    for node_type in self.model.node_types:
+                        if node_type in data and 'x' in data[node_type]:
+                            x_dict[node_type] = data[node_type].x
+                    for edge_key in data.edge_types:
+                        if edge_key in data.edge_index_dict:
+                            edge_index_dict[edge_key] = data[edge_key].edge_index
 
-                loss = self.criterion(logits[train_mask], labels[train_mask])
+                    probabilities = self.model.predict_snp_importance(x_dict, edge_index_dict)
+                    logits = torch.log(probabilities + 1e-10)
+                    loss = self.criterion(logits[train_mask], labels[train_mask])
 
-                loss.backward()
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self._nan_counter += 1
+                    result.nan_recovery_count += 1
+                    logger.warning(f"NaN loss at epoch {epoch+1}, recovery count: {self._nan_counter}")
+                    if self._nan_counter >= self.config.nan_patience:
+                        logger.error("NaN patience exceeded")
+                        result.errors.append("Persistent NaN loss")
+                        if best_model_state:
+                            self.model.load_state_dict(best_model_state)
+                        return result
+                    continue
 
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    self.config.gradient_clip
+                    self.config.gradient_clip_norm
                 )
-
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 train_loss = loss.item()
                 train_acc = self._compute_accuracy(probabilities[train_mask], labels[train_mask])
 
                 self.model.eval()
                 with torch.no_grad():
-                    val_probs = self.model.predict_snp_importance(data)
+                    x_dict = {}
+                    edge_index_dict = {}
+                    for node_type in self.model.node_types:
+                        if node_type in data and 'x' in data[node_type]:
+                            x_dict[node_type] = data[node_type].x
+                    for edge_key in data.edge_types:
+                        if edge_key in data.edge_index_dict:
+                            edge_index_dict[edge_key] = data[edge_key].edge_index
+
+                    val_probs = self.model.predict_snp_importance(x_dict, edge_index_dict)
                     val_loss = self.criterion(
                         torch.log(val_probs[val_mask] + 1e-10),
                         labels[val_mask]
@@ -225,7 +557,7 @@ class GNNTrainer:
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
-                    best_model_state = self.model.state_dict().copy()
+                    best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
                 else:
                     patience_counter += 1
                     if patience_counter >= self.config.patience:
@@ -236,10 +568,20 @@ class GNNTrainer:
 
             if best_model_state is not None:
                 self.model.load_state_dict(best_model_state)
+                self.model.to(self.device)
 
             self.model.eval()
             with torch.no_grad():
-                test_probs = self.model.predict_snp_importance(data)
+                x_dict = {}
+                edge_index_dict = {}
+                for node_type in self.model.node_types:
+                    if node_type in data and 'x' in data[node_type]:
+                        x_dict[node_type] = data[node_type].x
+                for edge_key in data.edge_types:
+                    if edge_key in data.edge_index_dict:
+                        edge_index_dict[edge_key] = data[edge_key].edge_index
+
+                test_probs = self.model.predict_snp_importance(x_dict, edge_index_dict)
                 test_loss = self.criterion(
                     torch.log(test_probs[test_mask] + 1e-10),
                     labels[test_mask]
@@ -266,6 +608,36 @@ class GNNTrainer:
             raise
 
         return result
+
+    def _prepare_labels(
+        self,
+        pyg_data: PyGGraphData
+    ):
+        data = pyg_data.data
+        if 'SNP' in data and 'y' in data['SNP']:
+            labels = data['SNP'].y.long()
+            train_mask, val_mask, test_mask = self._split_data(labels)
+            return data, labels, train_mask, val_mask, test_mask
+        return data, None, None, None, None
+
+    def _split_data(
+        self,
+        labels: torch.Tensor,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        test_ratio: float = 0.15
+    ):
+        n = len(labels)
+        indices = torch.randperm(n)
+
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
+
+        train_mask = indices[:train_end]
+        val_mask = indices[train_end:val_end]
+        test_mask = indices[val_end:]
+
+        return train_mask, val_mask, test_mask
 
     def _compute_accuracy(
         self,
@@ -301,7 +673,9 @@ class GNNTrainer:
                 'hidden_channels': self.model.hidden_channels,
                 'num_layers': self.model.num_layers,
                 'dropout': self.model.dropout,
-                'embedding_dim': self.model.embedding_dim
+                'embedding_dim': self.model.embedding_dim,
+                'residual_alpha': self.model.residual_alpha,
+                'layer_norm_eps': self.model.layer_norm_eps
             }
         }
 
@@ -312,7 +686,7 @@ class GNNTrainer:
         path = model_path or settings.GNN_MODEL_PATH
         if os.path.exists(path):
             try:
-                checkpoint = torch.load(path, map_location=self.device)
+                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
                 self.model.load_state_dict(checkpoint['model_state_dict'])
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 self.last_train_timestamp = checkpoint.get('last_train_timestamp')
@@ -360,16 +734,28 @@ class GNNTrainer:
         for edge in new_edges:
             all_edges.append(edge)
 
-        new_pyg_data = self.graph_converter.convert_to_pyg(all_nodes, all_edges)
-
-        result = await self.train(
-            new_pyg_data,
-            incremental=True,
-            new_nodes_count=new_nodes_count,
-            new_edges_count=new_edges_count
-        )
-
-        return result
+        if settings.SAMPLING_ENABLED:
+            sampled_data = self.graph_converter.convert_to_sampled(
+                nodes=all_nodes,
+                edges=all_edges,
+                degree_threshold=settings.SAMPLING_DEGREE_THRESHOLD,
+                random_walk_length=settings.SAMPLING_RANDOM_WALK_LENGTH,
+                random_walk_iterations=settings.SAMPLING_RANDOM_WALK_ITERATIONS
+            )
+            return await self.train_sampled(
+                sampled_data,
+                incremental=True,
+                new_nodes_count=new_nodes_count,
+                new_edges_count=new_edges_count
+            )
+        else:
+            new_pyg_data = self.graph_converter.convert_to_pyg(all_nodes, all_edges)
+            return await self.train(
+                new_pyg_data,
+                incremental=True,
+                new_nodes_count=new_nodes_count,
+                new_edges_count=new_edges_count
+            )
 
     def get_model_summary(self) -> Dict[str, Any]:
         return {
@@ -378,8 +764,14 @@ class GNNTrainer:
             "num_layers": self.model.num_layers,
             "dropout": self.model.dropout,
             "embedding_dim": self.model.embedding_dim,
+            "residual_alpha": self.model.residual_alpha,
             "is_trained": self.is_trained,
             "last_train_timestamp": self.last_train_timestamp,
             "device": str(self.device),
-            "parameters": sum(p.numel() for p in self.model.parameters())
+            "parameters": sum(p.numel() for p in self.model.parameters()),
+            "config": {
+                "gradient_clip_norm": self.config.gradient_clip_norm,
+                "use_amp": self.config.use_amp,
+                "label_smoothing": self.config.label_smoothing
+            }
         }

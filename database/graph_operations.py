@@ -401,3 +401,81 @@ class GraphOperations:
                 dict(record["assoc_rel"])
             ))
         return edges
+
+    async def get_node_degree_stats(
+        self,
+        label: str,
+        relationship_type: Optional[str] = None,
+        direction: str = "both"
+    ) -> Dict[str, Any]:
+        node_label = self.schema.get_node_label(label)
+
+        rel_clause = ""
+        if relationship_type:
+            rel_type = self.schema.get_rel_type(relationship_type)
+            if direction == "out":
+                rel_clause = f"-[:{rel_type}]->"
+            elif direction == "in":
+                rel_clause = f"<-[:{rel_type}]-"
+            else:
+                rel_clause = f"-[:{rel_type}]-"
+        else:
+            if direction == "out":
+                rel_clause = "-->"
+            elif direction == "in":
+                rel_clause = "<--"
+            else:
+                rel_clause = "--"
+
+        query = f"""
+        MATCH (n:{node_label})
+        OPTIONAL MATCH (n){rel_clause}(neighbor)
+        WITH n, count(neighbor) as degree
+        RETURN avg(degree) as avg_degree,
+               max(degree) as max_degree,
+               min(degree) as min_degree,
+               percentileCont(degree, 0.5) as median_degree,
+               percentileCont(degree, 0.95) as p95_degree,
+               count(n) as total_nodes
+        """
+        result = await self.driver.execute_query(query)
+
+        if not result:
+            return {"avg_degree": 0, "max_degree": 0, "min_degree": 0,
+                    "median_degree": 0, "p95_degree": 0, "total_nodes": 0}
+
+        record = result[0]
+        return {
+            "avg_degree": float(record.get("avg_degree", 0) or 0),
+            "max_degree": int(record.get("max_degree", 0) or 0),
+            "min_degree": int(record.get("min_degree", 0) or 0),
+            "median_degree": float(record.get("median_degree", 0) or 0),
+            "p95_degree": float(record.get("p95_degree", 0) or 0),
+            "total_nodes": int(record.get("total_nodes", 0) or 0)
+        }
+
+    async def get_high_degree_nodes(
+        self,
+        label: str,
+        degree_threshold: int = 50,
+        limit: int = 1000
+    ) -> List[Dict[str, Any]]:
+        node_label = self.schema.get_node_label(label)
+        query = f"""
+        MATCH (n:{node_label})--(neighbor)
+        WITH n, count(neighbor) as degree
+        WHERE degree >= $threshold
+        RETURN n, degree
+        ORDER BY degree DESC
+        LIMIT $limit
+        """
+        result = await self.driver.execute_query(
+            query, {"threshold": degree_threshold, "limit": limit}
+        )
+        return [
+            {
+                "node": dict(record["n"]),
+                "degree": int(record["degree"])
+            }
+            for record in result
+        ]

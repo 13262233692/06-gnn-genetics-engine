@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import settings
 from database import Neo4jDriver, GraphSchema, GraphOperations
-from ml import GeneticsGNN, GNNTrainer, SNPredictor, GraphConverter
+from ml import HeterogeneousGNN, GNNTrainer, SNPredictor, GraphConverter
 from scheduler import IncrementalTrainer, TrainingScheduler
 from app.api import (
     predict_router,
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 neo4j_driver: Optional[Neo4jDriver] = None
 graph_ops: Optional[GraphOperations] = None
-gnn_model: Optional[GeneticsGNN] = None
+gnn_model: Optional[HeterogeneousGNN] = None
 gnn_trainer: Optional[GNNTrainer] = None
 sn_predictor: Optional[SNPredictor] = None
 incremental_trainer: Optional[IncrementalTrainer] = None
@@ -62,19 +62,25 @@ def init_gnn() -> None:
     os.makedirs(os.path.dirname(settings.GNN_MODEL_PATH), exist_ok=True)
     
     graph_converter = GraphConverter(
-        embedding_dim=settings.GNN_EMBEDDING_DIM
+        embedding_dim=settings.GNN_EMBEDDING_DIM,
+        num_neighbors=settings.SAMPLING_NUM_NEIGHBORS,
+        batch_size=settings.GNN_BATCH_SIZE
     )
     
-    gnn_model = GeneticsGNN(
+    gnn_model = HeterogeneousGNN(
         hidden_channels=settings.GNN_HIDDEN_DIM,
         num_layers=settings.GNN_NUM_LAYERS,
-        dropout=settings.GNN_DROPOUT
+        node_types=graph_converter.NODE_TYPES,
+        edge_types=graph_converter.EDGE_TYPES,
+        dropout=settings.GNN_DROPOUT,
+        embedding_dim=settings.GNN_EMBEDDING_DIM,
+        residual_alpha=settings.RESIDUAL_ALPHA,
+        layer_norm_eps=settings.LAYER_NORM_EPS
     )
     
     gnn_trainer = GNNTrainer(
         model=gnn_model,
-        learning_rate=settings.GNN_LEARNING_RATE,
-        model_path=settings.GNN_MODEL_PATH
+        graph_converter=graph_converter
     )
     
     if os.path.exists(settings.GNN_MODEL_PATH):
@@ -82,9 +88,9 @@ def init_gnn() -> None:
         gnn_trainer.load_model()
     
     sn_predictor = SNPredictor(
-        model=gnn_model,
-        graph_converter=graph_converter,
-        graph_ops=graph_ops
+        trainer=gnn_trainer,
+        graph_ops=graph_ops,
+        graph_converter=graph_converter
     )
     
     logger.info("GNN model initialized successfully")
@@ -97,8 +103,11 @@ def init_scheduler() -> None:
     incremental_trainer = IncrementalTrainer(
         graph_ops=graph_ops,
         trainer=gnn_trainer,
-        graph_converter=GraphConverter(embedding_dim=settings.GNN_EMBEDDING_DIM),
-        incremental_batch_size=settings.INCREMENTAL_BATCH_SIZE
+        graph_converter=GraphConverter(
+            embedding_dim=settings.GNN_EMBEDDING_DIM,
+            num_neighbors=settings.SAMPLING_NUM_NEIGHBORS,
+            batch_size=settings.GNN_BATCH_SIZE
+        )
     )
     
     training_scheduler = TrainingScheduler(
@@ -115,7 +124,7 @@ def init_scheduler() -> None:
 
 def set_api_dependencies() -> None:
     logger.info("Setting API dependencies...")
-    predict_api.set_dependencies(sn_predictor)
+    predict_api.set_predictor(sn_predictor)
     ingestion_api.set_dependencies(graph_ops)
     training_api.set_dependencies(gnn_trainer, training_scheduler, incremental_trainer)
     graph_api.set_dependencies(graph_ops)

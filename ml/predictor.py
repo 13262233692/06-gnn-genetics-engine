@@ -2,10 +2,12 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import gc
 import numpy as np
 import torch
+from torch_geometric.loader import NeighborLoader
 from .gnn_model import HeterogeneousGNN
-from .graph_converter import GraphConverter, PyGGraphData
+from .graph_converter import GraphConverter, PyGGraphData, SampledGraphData
 from .trainer import GNNTrainer
 from database import GraphOperations
 
@@ -63,6 +65,7 @@ class PredictionResult:
     model_version: str = "1.0.0"
     graph_subset_size: int = 0
     inference_time_ms: float = 0.0
+    sampling_used: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -73,6 +76,7 @@ class PredictionResult:
             "model_version": self.model_version,
             "graph_subset_size": self.graph_subset_size,
             "inference_time_ms": float(self.inference_time_ms),
+            "sampling_used": self.sampling_used,
             "summary": {
                 "top_snps_count": len(self.target_snps),
                 "average_confidence": float(np.mean([s.confidence for s in self.target_snps])) if self.target_snps else 0.0,
@@ -103,7 +107,8 @@ class SNPredictor:
         phenotype_name: str,
         min_p_value: float = 1e-5,
         top_k: int = 50,
-        max_depth: int = 3
+        max_depth: int = 3,
+        use_sampling: bool = True
     ) -> PredictionResult:
         logger.info(f"Predicting target SNPs for phenotype: {phenotype_name}")
         start_time = datetime.now()
@@ -137,15 +142,20 @@ class SNPredictor:
         if phenotype_id is None:
             phenotype_id = f"PHENO:{phenotype_name.replace(' ', '_')}"
 
-        pyg_data = self.graph_converter.convert_to_pyg(
-            nodes=subgraph_data["nodes"],
-            edges=subgraph_data["edges"],
-            target_phenotype_id=phenotype_id
-        )
+        if use_sampling:
+            probabilities, snp_mapping, sampling_used = self._run_sampled_inference(
+                subgraph_data, phenotype_id
+            )
+        else:
+            pyg_data = self.graph_converter.convert_to_pyg(
+                nodes=subgraph_data["nodes"],
+                edges=subgraph_data["edges"],
+                target_phenotype_id=phenotype_id
+            )
+            probabilities = self._run_inference(pyg_data)
+            snp_mapping = pyg_data.node_mapping.get("SNP", {})
+            sampling_used = False
 
-        probabilities = self._run_inference(pyg_data)
-
-        snp_mapping = pyg_data.node_mapping.get("SNP", {})
         snp_details = await self._get_snp_details(list(snp_mapping.keys()))
 
         target_snps = []
@@ -202,20 +212,129 @@ class SNPredictor:
             target_snps=target_snps,
             total_snps_analyzed=len(snp_mapping),
             graph_subset_size=len(subgraph_data["nodes"]),
-            inference_time_ms=inference_time
+            inference_time_ms=inference_time,
+            sampling_used=sampling_used
         )
 
         logger.info(f"Prediction completed for {phenotype_name}: "
-                    f"found {len(target_snps)} target SNPs in {inference_time:.2f}ms")
+                    f"found {len(target_snps)} target SNPs in {inference_time:.2f}ms "
+                    f"(sampling={'yes' if sampling_used else 'no'})")
 
         return result
+
+    def _run_sampled_inference(
+        self,
+        subgraph_data: Dict[str, Any],
+        phenotype_id: str
+    ) -> tuple:
+        try:
+            pyg_data = self.graph_converter.convert_to_pyg(
+                nodes=subgraph_data["nodes"],
+                edges=subgraph_data["edges"],
+                target_phenotype_id=phenotype_id
+            )
+
+            data = pyg_data.data
+            snp_mapping = pyg_data.node_mapping.get("SNP", {})
+
+            if 'SNP' not in data or data['SNP'].num_nodes is None or data['SNP'].num_nodes == 0:
+                return torch.zeros(0, 2, device=self.device), snp_mapping, False
+
+            snp_count = data['SNP'].num_nodes
+
+            inference_loader = self.graph_converter.create_inference_loader(
+                data,
+                target_node_type='SNP',
+                target_indices=torch.arange(snp_count)
+            )
+
+            self.trainer.model.eval()
+            all_probabilities = []
+
+            with torch.no_grad():
+                for batch in inference_loader:
+                    batch = batch.to(self.device)
+
+                    x_dict, edge_index_dict = self._extract_batch_data(batch)
+
+                    x_dict_filtered = {k: v for k, v in x_dict.items() if v is not None}
+                    edge_index_filtered = {k: v for k, v in edge_index_dict.items()
+                                          if k[0] in x_dict_filtered and k[2] in x_dict_filtered}
+
+                    with torch.amp.autocast(
+                        device_type=self.device.type,
+                        enabled=self.device.type == 'cuda'
+                    ):
+                        probabilities = self.trainer.model.predict_snp_importance(
+                            x_dict_filtered,
+                            edge_index_filtered
+                        )
+
+                    snp_n_id = self._get_input_node_indices(batch, 'SNP')
+                    if snp_n_id is not None:
+                        all_probabilities.append((snp_n_id.cpu(), probabilities.cpu()))
+                    else:
+                        all_probabilities.append(
+                            (torch.arange(probabilities.size(0)), probabilities.cpu())
+                        )
+
+                    del batch
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+            full_probabilities = torch.zeros(snp_count, 2, dtype=torch.float32)
+            for n_id, probs in all_probabilities:
+                valid_mask = n_id < snp_count
+                if valid_mask.any():
+                    full_probabilities[n_id[valid_mask]] = probs[:valid_mask.sum()]
+
+            return full_probabilities, snp_mapping, True
+
+        except Exception as e:
+            logger.warning(f"Sampled inference failed: {e}, falling back to full inference")
+            pyg_data = self.graph_converter.convert_to_pyg(
+                nodes=subgraph_data["nodes"],
+                edges=subgraph_data["edges"],
+                target_phenotype_id=phenotype_id
+            )
+            probabilities = self._run_inference(pyg_data)
+            snp_mapping = pyg_data.node_mapping.get("SNP", {})
+            return probabilities, snp_mapping, False
+
+    def _extract_batch_data(self, batch):
+        x_dict = {}
+        edge_index_dict = {}
+
+        for node_type in self.trainer.model.node_types:
+            if node_type in batch and 'x' in batch[node_type]:
+                x_dict[node_type] = batch[node_type].x
+
+        for edge_type in batch.edge_types:
+            if hasattr(batch[edge_type], 'edge_index'):
+                edge_index_dict[edge_type] = batch[edge_type].edge_index
+
+        return x_dict, edge_index_dict
+
+    def _get_input_node_indices(self, batch, node_type='SNP'):
+        if node_type in batch and hasattr(batch[node_type], 'n_id'):
+            return batch[node_type].n_id
+        return None
 
     def _run_inference(self, pyg_data: PyGGraphData) -> torch.Tensor:
         self.trainer.model.eval()
         data = pyg_data.data.to(self.device)
 
         with torch.no_grad():
-            probabilities = self.trainer.model.predict_snp_importance(data)
+            x_dict = {}
+            edge_index_dict = {}
+            for node_type in self.trainer.model.node_types:
+                if node_type in data and 'x' in data[node_type]:
+                    x_dict[node_type] = data[node_type].x
+            for edge_key in data.edge_types:
+                if edge_key in data.edge_index_dict:
+                    edge_index_dict[edge_key] = data[edge_key].edge_index
+
+            probabilities = self.trainer.model.predict_snp_importance(x_dict, edge_index_dict)
 
         return probabilities
 
@@ -268,7 +387,8 @@ class SNPredictor:
         self,
         phenotype_names: List[str],
         min_p_value: float = 1e-5,
-        top_k: int = 50
+        top_k: int = 50,
+        use_sampling: bool = True
     ) -> List[PredictionResult]:
         results = []
         for phenotype_name in phenotype_names:
@@ -276,7 +396,8 @@ class SNPredictor:
                 result = await self.predict(
                     phenotype_name=phenotype_name,
                     min_p_value=min_p_value,
-                    top_k=top_k
+                    top_k=top_k,
+                    use_sampling=use_sampling
                 )
                 results.append(result)
             except Exception as e:
@@ -288,14 +409,16 @@ class SNPredictor:
         phenotype_name: str,
         num_samples: int = 10,
         min_p_value: float = 1e-5,
-        top_k: int = 50
+        top_k: int = 50,
+        use_sampling: bool = True
     ) -> Dict[str, Any]:
         logger.info(f"Predicting with uncertainty for phenotype: {phenotype_name}")
 
         base_result = await self.predict(
             phenotype_name=phenotype_name,
             min_p_value=min_p_value,
-            top_k=top_k
+            top_k=top_k,
+            use_sampling=use_sampling
         )
 
         self.trainer.model.train()
@@ -305,7 +428,8 @@ class SNPredictor:
             result = await self.predict(
                 phenotype_name=phenotype_name,
                 min_p_value=min_p_value,
-                top_k=top_k
+                top_k=top_k,
+                use_sampling=use_sampling
             )
             all_predictions.append(result)
 
@@ -333,7 +457,8 @@ class SNPredictor:
         return {
             "base_prediction": base_result.to_dict(),
             "uncertainty_estimates": snp_uncertainties,
-            "monte_carlo_samples": num_samples
+            "monte_carlo_samples": num_samples,
+            "sampling_used": base_result.sampling_used
         }
 
     def get_snp_network_centrality(
