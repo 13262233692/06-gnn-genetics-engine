@@ -2,6 +2,13 @@ from .gnn_model import GeneticsGNN, HeterogeneousGNN, StableGATConv, PreNormResi
 from .trainer import GNNTrainer, TrainingConfig, TrainingResult
 from .predictor import SNPredictor, PredictionResult, TargetSNP
 from .graph_converter import GraphConverter, PyGGraphData, SampledGraphData
+from .explainer import (
+    AttentionFlowExplainer,
+    SNPExplanation,
+    ExplanationPath,
+    ExplanationPathNode,
+    ExplanationPathEdge
+)
 
 __all__ = [
     "GeneticsGNN",
@@ -16,5 +23,10 @@ __all__ = [
     "TargetSNP",
     "GraphConverter",
     "PyGGraphData",
-    "SampledGraphData"
+    "SampledGraphData",
+    "AttentionFlowExplainer",
+    "SNPExplanation",
+    "ExplanationPath",
+    "ExplanationPathNode",
+    "ExplanationPathEdge"
 ]

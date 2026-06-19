@@ -44,6 +44,12 @@ class StableGATConv(nn.Module):
         self.bias = nn.Parameter(torch.Tensor(self._out_channels)) if concat else nn.Parameter(torch.Tensor(out_channels))
 
         self.leaky_relu = nn.LeakyReLU(negative_slope)
+
+        self._attention_weights: Optional[torch.Tensor] = None
+        self._edge_index: Optional[torch.Tensor] = None
+        self._attn_hooks: list = []
+        self._capture_enabled: bool = False
+
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -53,6 +59,29 @@ class StableGATConv(nn.Module):
         nn.init.xavier_uniform_(self.att_src, gain=gain)
         nn.init.xavier_uniform_(self.att_dst, gain=gain)
         nn.init.zeros_(self.bias)
+
+    def enable_capture(self) -> None:
+        self._capture_enabled = True
+        self._attention_weights = None
+        self._edge_index = None
+
+    def disable_capture(self) -> None:
+        self._capture_enabled = False
+
+    def register_attention_hook(self, hook_fn) -> Any:
+        handle = self.register_forward_hook(hook_fn)
+        self._attn_hooks.append(handle)
+        return handle
+
+    def clear_hooks(self) -> None:
+        for handle in self._attn_hooks:
+            handle.remove()
+        self._attn_hooks = []
+
+    def get_last_attention(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if self._attention_weights is None or self._edge_index is None:
+            return None
+        return self._edge_index.detach().cpu(), self._attention_weights.detach().cpu()
 
     def forward(
         self,
@@ -79,6 +108,10 @@ class StableGATConv(nn.Module):
         alpha = alpha / (alpha.sum(dim=0, keepdim=True) + 1e-16)
 
         alpha = torch.clamp(alpha, min=0.0, max=1.0)
+
+        if self._capture_enabled:
+            self._attention_weights = alpha
+            self._edge_index = edge_index
 
         out = torch.zeros(num_nodes, self.heads, self.out_channels, device=x.device, dtype=x.dtype)
 
@@ -207,7 +240,43 @@ class HeterogeneousGNN(nn.Module):
             nn.Linear(hidden_channels // 2, 2)
         )
 
+        self._capture_attention = False
+        self._collected_attention: Optional[List[Dict[str, Any]]] = None
+
         self._reset_all_parameters()
+
+    def enable_attention_capture(self) -> None:
+        self._capture_attention = True
+        self._collected_attention = []
+        for layer_idx, hetero_conv in enumerate(self.convs):
+            for edge_key, conv_module in hetero_conv.convs.items():
+                if isinstance(conv_module, StableGATConv):
+                    conv_module.enable_capture()
+
+    def disable_attention_capture(self) -> None:
+        self._capture_attention = False
+        for hetero_conv in self.convs:
+            for edge_key, conv_module in hetero_conv.convs.items():
+                if isinstance(conv_module, StableGATConv):
+                    conv_module.disable_capture()
+
+    def collect_captured_attention(self) -> List[Dict[str, Any]]:
+        collected = []
+        for layer_idx, hetero_conv in enumerate(self.convs):
+            for edge_key, conv_module in hetero_conv.convs.items():
+                if isinstance(conv_module, StableGATConv):
+                    attn_data = conv_module.get_last_attention()
+                    if attn_data is not None:
+                        edge_index, alpha = attn_data
+                        alpha_mean = alpha.mean(dim=-1)
+                        collected.append({
+                            "layer": layer_idx,
+                            "edge_type": edge_key,
+                            "edge_index": edge_index,
+                            "alpha": alpha_mean,
+                            "alpha_per_head": alpha
+                        })
+        return collected
 
     def _reset_all_parameters(self) -> None:
         for module in self.modules():

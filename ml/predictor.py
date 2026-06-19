@@ -9,6 +9,11 @@ from torch_geometric.loader import NeighborLoader
 from .gnn_model import HeterogeneousGNN
 from .graph_converter import GraphConverter, PyGGraphData, SampledGraphData
 from .trainer import GNNTrainer
+from .explainer import (
+    AttentionFlowExplainer,
+    SNPExplanation,
+    ExplanationPath
+)
 from database import GraphOperations
 
 logger = logging.getLogger(__name__)
@@ -32,9 +37,10 @@ class TargetSNP:
     variant_type: Optional[str]
     functional_impact: Optional[str]
     rank: int
+    explanation: Optional[SNPExplanation] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "snp_id": self.snp_id,
             "rs_id": self.rs_id,
             "chromosome": self.chromosome,
@@ -54,6 +60,11 @@ class TargetSNP:
             "functional_impact": self.functional_impact,
             "rank": self.rank
         }
+        if self.explanation is not None:
+            result["explanation"] = self.explanation.to_dict()
+        else:
+            result["explanation"] = None
+        return result
 
 
 @dataclass
@@ -66,6 +77,7 @@ class PredictionResult:
     graph_subset_size: int = 0
     inference_time_ms: float = 0.0
     sampling_used: bool = False
+    explanation_enabled: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -77,11 +89,13 @@ class PredictionResult:
             "graph_subset_size": self.graph_subset_size,
             "inference_time_ms": float(self.inference_time_ms),
             "sampling_used": self.sampling_used,
+            "explanation_enabled": self.explanation_enabled,
             "summary": {
                 "top_snps_count": len(self.target_snps),
                 "average_confidence": float(np.mean([s.confidence for s in self.target_snps])) if self.target_snps else 0.0,
                 "max_confidence": float(max([s.confidence for s in self.target_snps])) if self.target_snps else 0.0,
-                "min_confidence": float(min([s.confidence for s in self.target_snps])) if self.target_snps else 0.0
+                "min_confidence": float(min([s.confidence for s in self.target_snps])) if self.target_snps else 0.0,
+                "explanations_included": self.explanation_enabled and any(s.explanation is not None for s in self.target_snps)
             }
         }
 
@@ -108,9 +122,14 @@ class SNPredictor:
         min_p_value: float = 1e-5,
         top_k: int = 50,
         max_depth: int = 3,
-        use_sampling: bool = True
+        use_sampling: bool = True,
+        include_explanation: bool = True,
+        explanation_top_paths: int = 5
     ) -> PredictionResult:
-        logger.info(f"Predicting target SNPs for phenotype: {phenotype_name}")
+        logger.info(
+            f"Predicting target SNPs for phenotype: {phenotype_name} "
+            f"(explanation={'on' if include_explanation else 'off'})"
+        )
         start_time = datetime.now()
 
         snp_associations = await self.graph_ops.get_snps_associated_with_phenotype(
@@ -125,7 +144,8 @@ class SNPredictor:
                 phenotype_name=phenotype_name,
                 target_snps=[],
                 total_snps_analyzed=0,
-                inference_time_ms=0.0
+                inference_time_ms=0.0,
+                explanation_enabled=include_explanation
             )
 
         subgraph_data = await self.graph_ops.get_gene_snp_phenotype_subgraph(
@@ -142,19 +162,38 @@ class SNPredictor:
         if phenotype_id is None:
             phenotype_id = f"PHENO:{phenotype_name.replace(' ', '_')}"
 
-        if use_sampling:
+        pyg_data = self.graph_converter.convert_to_pyg(
+            nodes=subgraph_data["nodes"],
+            edges=subgraph_data["edges"],
+            target_phenotype_id=phenotype_id
+        )
+
+        use_explanation_full_graph = include_explanation and not use_sampling
+
+        if use_explanation_full_graph:
+            probabilities, snp_mapping, sampling_used, explainer = self._run_inference_with_explanation(
+                pyg_data,
+                explanation_top_paths=explanation_top_paths
+            )
+        elif use_sampling:
             probabilities, snp_mapping, sampling_used = self._run_sampled_inference(
                 subgraph_data, phenotype_id
             )
+            explainer = None
         else:
-            pyg_data = self.graph_converter.convert_to_pyg(
-                nodes=subgraph_data["nodes"],
-                edges=subgraph_data["edges"],
-                target_phenotype_id=phenotype_id
-            )
             probabilities = self._run_inference(pyg_data)
             snp_mapping = pyg_data.node_mapping.get("SNP", {})
             sampling_used = False
+            explainer = None
+
+        if include_explanation and sampling_used:
+            explainer = self._generate_explanations_for_top_sampling(
+                pyg_data=pyg_data,
+                probabilities=probabilities,
+                snp_mapping=snp_mapping,
+                top_k_for_explanation=min(top_k * 2, 100),
+                explanation_top_paths=explanation_top_paths
+            )
 
         snp_details = await self._get_snp_details(list(snp_mapping.keys()))
 
@@ -176,6 +215,17 @@ class SNPredictor:
                 go_terms = await self._get_go_terms_for_snp(snp_id, subgraph_data["edges"])
                 associated_genes = self._get_associated_genes(snp_id, subgraph_data["edges"])
 
+                explanation = None
+                if include_explanation:
+                    if explainer is not None:
+                        if use_explanation_full_graph:
+                            explanation = explainer.get(
+                                snp_id,
+                                explainer.explain_snp(idx, pyg_data, explanation_top_paths)
+                            )
+                        else:
+                            explanation = explainer.get(snp_id)
+
                 target_snp = TargetSNP(
                     snp_id=snp_id,
                     rs_id=detail.get("rs_id"),
@@ -195,7 +245,8 @@ class SNPredictor:
                     odds_ratio=association["association"].get("odds_ratio") if association else None,
                     variant_type=detail.get("variant_type"),
                     functional_impact=detail.get("functional_impact"),
-                    rank=0
+                    rank=0,
+                    explanation=explanation
                 )
                 target_snps.append(target_snp)
 
@@ -213,14 +264,100 @@ class SNPredictor:
             total_snps_analyzed=len(snp_mapping),
             graph_subset_size=len(subgraph_data["nodes"]),
             inference_time_ms=inference_time,
-            sampling_used=sampling_used
+            sampling_used=sampling_used,
+            explanation_enabled=include_explanation
         )
 
-        logger.info(f"Prediction completed for {phenotype_name}: "
-                    f"found {len(target_snps)} target SNPs in {inference_time:.2f}ms "
-                    f"(sampling={'yes' if sampling_used else 'no'})")
+        logger.info(
+            f"Prediction completed for {phenotype_name}: "
+            f"found {len(target_snps)} target SNPs in {inference_time:.2f}ms "
+            f"(sampling={'yes' if sampling_used else 'no'}, "
+            f"explanation={'yes' if include_explanation else 'no'})"
+        )
 
         return result
+
+    def _run_inference_with_explanation(
+        self,
+        pyg_data: PyGGraphData,
+        explanation_top_paths: int = 5
+    ):
+        self.trainer.model.eval()
+        data = pyg_data.data.to(self.device)
+
+        explainer_engine = AttentionFlowExplainer(
+            model=self.trainer.model,
+            top_k_paths=explanation_top_paths
+        )
+
+        with explainer_engine:
+            with torch.no_grad():
+                x_dict = {}
+                edge_index_dict = {}
+                for node_type in self.trainer.model.node_types:
+                    if node_type in data and 'x' in data[node_type]:
+                        x_dict[node_type] = data[node_type].x
+                for edge_key in data.edge_types:
+                    if edge_key in data.edge_index_dict:
+                        edge_index_dict[edge_key] = data[edge_key].edge_index
+
+                probabilities = self.trainer.model.predict_snp_importance(x_dict, edge_index_dict)
+
+        snp_mapping = pyg_data.node_mapping.get("SNP", {})
+        return probabilities, snp_mapping, False, explainer_engine
+
+    def _generate_explanations_for_top_sampling(
+        self,
+        pyg_data: PyGGraphData,
+        probabilities: torch.Tensor,
+        snp_mapping: Dict[str, int],
+        top_k_for_explanation: int,
+        explanation_top_paths: int
+    ) -> Dict[str, SNPExplanation]:
+        logger.info(f"Generating explanations for top-{top_k_for_explanation} SNPs via full-graph forward")
+
+        sorted_items = sorted(
+            snp_mapping.items(),
+            key=lambda kv: probabilities[kv[1], 1].item() if kv[1] < len(probabilities) else 0.0,
+            reverse=True
+        )[:top_k_for_explanation]
+
+        target_indices = [idx for _, idx in sorted_items if idx < len(probabilities)]
+        self.trainer.model.eval()
+        data = pyg_data.data.to(self.device)
+
+        results: Dict[str, SNPExplanation] = {}
+
+        explainer_engine = AttentionFlowExplainer(
+            model=self.trainer.model,
+            top_k_paths=explanation_top_paths
+        )
+
+        with explainer_engine:
+            with torch.no_grad():
+                x_dict = {}
+                edge_index_dict = {}
+                for node_type in self.trainer.model.node_types:
+                    if node_type in data and 'x' in data[node_type]:
+                        x_dict[node_type] = data[node_type].x
+                for edge_key in data.edge_types:
+                    if edge_key in data.edge_index_dict:
+                        edge_index_dict[edge_key] = data[edge_key].edge_index
+
+                _ = self.trainer.model.predict_snp_importance(x_dict, edge_index_dict)
+
+        for snp_id, snp_idx in sorted_items:
+            if snp_idx >= len(probabilities):
+                continue
+            explanation = explainer_engine.explain_snp(snp_idx, pyg_data, explanation_top_paths)
+            if explanation:
+                results[snp_id] = explanation
+
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+        logger.info(f"Generated {len(results)} SNP explanations")
+        return results
 
     def _run_sampled_inference(
         self,
@@ -388,7 +525,9 @@ class SNPredictor:
         phenotype_names: List[str],
         min_p_value: float = 1e-5,
         top_k: int = 50,
-        use_sampling: bool = True
+        use_sampling: bool = True,
+        include_explanation: bool = True,
+        explanation_top_paths: int = 5
     ) -> List[PredictionResult]:
         results = []
         for phenotype_name in phenotype_names:
@@ -397,7 +536,9 @@ class SNPredictor:
                     phenotype_name=phenotype_name,
                     min_p_value=min_p_value,
                     top_k=top_k,
-                    use_sampling=use_sampling
+                    use_sampling=use_sampling,
+                    include_explanation=include_explanation,
+                    explanation_top_paths=explanation_top_paths
                 )
                 results.append(result)
             except Exception as e:
@@ -410,7 +551,9 @@ class SNPredictor:
         num_samples: int = 10,
         min_p_value: float = 1e-5,
         top_k: int = 50,
-        use_sampling: bool = True
+        use_sampling: bool = True,
+        include_explanation: bool = False,
+        explanation_top_paths: int = 5
     ) -> Dict[str, Any]:
         logger.info(f"Predicting with uncertainty for phenotype: {phenotype_name}")
 
@@ -418,7 +561,9 @@ class SNPredictor:
             phenotype_name=phenotype_name,
             min_p_value=min_p_value,
             top_k=top_k,
-            use_sampling=use_sampling
+            use_sampling=use_sampling,
+            include_explanation=include_explanation,
+            explanation_top_paths=explanation_top_paths
         )
 
         self.trainer.model.train()
@@ -429,7 +574,9 @@ class SNPredictor:
                 phenotype_name=phenotype_name,
                 min_p_value=min_p_value,
                 top_k=top_k,
-                use_sampling=use_sampling
+                use_sampling=use_sampling,
+                include_explanation=False,
+                explanation_top_paths=explanation_top_paths
             )
             all_predictions.append(result)
 

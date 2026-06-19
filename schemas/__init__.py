@@ -4,7 +4,12 @@ from .predict import (
     TargetSNPResponse,
     BatchPredictionRequest,
     BatchPredictionResponse,
-    UncertaintyPredictionResponse
+    UncertaintyPredictionResponse,
+    PredictionSummary,
+    ExplanationPathNodeResponse,
+    ExplanationPathEdgeResponse,
+    ExplanationPathResponse,
+    SNPExplanationResponse
 )
 from .ingestion import (
     IngestionRequest,
@@ -31,6 +36,11 @@ __all__ = [
     "PredictionRequest",
     "PredictionResponse",
     "TargetSNPResponse",
+    "PredictionSummary",
+    "ExplanationPathNodeResponse",
+    "ExplanationPathEdgeResponse",
+    "ExplanationPathResponse",
+    "SNPExplanationResponse",
     "BatchPredictionRequest",
     "BatchPredictionResponse",
     "UncertaintyPredictionResponse",
